@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            // 1. 确保包含 CUDA 头文件路径（建议用绝对路径）
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/local/cuda/include"
+            ],
+            // 2. 关键：添加这个宏定义，欺骗编辑器我们在使用 CUDA 编译器
+            // 这样 <cuda_runtime.h> 等头文件才会暴露正确的定义
+            "defines": [
+                "__CUDACC__"
+            ],
+            // 3. 将编译器改为 nvcc，IntelliSense 会自动向它查询系统包含路径
+            // 如果你的 nvcc 不在这个路径，请在终端输入 `which nvcc` 查看并修改
+            "compilerPath": "/usr/local/cuda/bin/nvcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
