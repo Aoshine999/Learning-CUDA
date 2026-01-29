@@ -3,6 +3,45 @@
 
 #include "../tester/utils.h"
 
+
+__global__ void traceKernel(const float* d_input, float* d_result, size_t rows, size_t cols, size_t min_dim);
+
+template <typename T>
+__global__ void flash_attn_kernel(
+    const T* __restrict__ Q, 
+    const T* __restrict__ K, 
+    const T* __restrict__ V, 
+    T* __restrict__ O,
+    const int batch_size, 
+    const int tgt_len, 
+    const int src_len, 
+    const int q_heads, 
+    const int kv_heads, 
+    const int head_dim, 
+    const float softmax_scale,
+    const bool is_causal
+);
+
+template <typename T>
+__global__ void flash_attn_kernel1(
+    const T* __restrict__ Q, 
+    const T* __restrict__ K, 
+    const T* __restrict__ V, 
+    T* __restrict__ O,
+    const int batch_size, 
+    const int tgt_len, 
+    const int src_len, 
+    const int q_heads, 
+    const int kv_heads, 
+    const int head_dim, 
+    const float softmax_scale,
+    const bool is_causal
+);
+
+
+
+
+
 /**
  * @brief Computes the trace of a matrix.
  *
@@ -99,12 +138,292 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   return h_result;
 }
 
-#define MAX_HEAD_DIM 128 // 最大头维度
-#define BR 64  // Block Row size (针对 Q 的分块)
-#define BC 64  // Block Col size (针对 K, V 的分块)
+#define MAX_HEAD_DIM 128
+#define BR 16
+#define BC 16
 
 template <typename T>
 __global__ void flash_attn_kernel(
+    const T* __restrict__ Q, 
+    const T* __restrict__ K, 
+    const T* __restrict__ V, 
+    T* __restrict__ O,
+    const int batch_size, 
+    const int tgt_len, 
+    const int src_len, 
+    const int q_heads, 
+    const int kv_heads, 
+    const int head_dim, 
+    const float softmax_scale,
+    const bool is_causal
+) {
+  // 1. 坐标设置
+  const int tx = threadIdx.x; 
+  const int q_block_idx = blockIdx.x; 
+  const int head_idx = blockIdx.y; 
+  const int batch_idx = blockIdx.z; 
+
+  // 2. GQA 映射
+  const int kv_head_idx = head_idx / (q_heads / kv_heads);
+
+  // 3. 内存偏移量 (使用 size_t 防止大张量溢出)
+  const size_t stride_q_b = (size_t)tgt_len * q_heads * head_dim;
+  const size_t stride_q_s = (size_t)q_heads * head_dim;
+  const size_t stride_q_h = (size_t)head_dim;
+
+  const size_t stride_k_b = (size_t)src_len * kv_heads * head_dim;
+  const size_t stride_k_s = (size_t)kv_heads * head_dim;
+  const size_t stride_k_h = (size_t)head_dim; 
+
+  const size_t q_offset_base = batch_idx * stride_q_b + head_idx * stride_q_h;
+  const size_t k_offset_base = batch_idx * stride_k_b + kv_head_idx * stride_k_h;
+  const size_t v_offset_base = batch_idx * stride_k_b + kv_head_idx * stride_k_h;
+  const size_t o_offset_base = batch_idx * stride_q_b + head_idx * stride_q_h;
+
+  // 4. 共享内存
+  extern __shared__ float sram[];
+  float *s_Q = sram; 
+  float *s_K = sram + BR * head_dim;
+  float *s_V = sram + BR * head_dim + BC * head_dim; 
+
+  // 5. 寄存器状态变量
+  float m_i = -INFINITY;
+  float l_i = 0.0f;
+  float acc_o[MAX_HEAD_DIM];
+  
+  // Kahan 补偿变量 - 用于减少累积误差
+  float l_c = 0.0f;  // l_i 的补偿
+  float acc_c[MAX_HEAD_DIM];  // acc_o 的补偿
+  
+  for (int d = 0; d < head_dim; ++d) {
+      acc_o[d] = 0.0f;
+      acc_c[d] = 0.0f;
+  }
+
+  // 6. 加载 Q Block
+  const int q_start = q_block_idx * BR;
+  const int q_len = (q_start + BR > tgt_len) ? (tgt_len - q_start) : BR;
+
+  for (int i = tx; i < BR * head_dim; i += blockDim.x) {
+      int r = i / head_dim;
+      int c = i % head_dim;
+      if (r < q_len) {
+          s_Q[i] = (float)Q[q_offset_base + (q_start + r) * stride_q_s + c];
+      } else {
+          s_Q[i] = 0.0f; 
+      }
+  }
+
+  __syncthreads();
+
+  // 7. 遍历所有 KV Blocks
+  const int num_k_blocks = (src_len + BC - 1) / BC;
+  
+  for (int j_block = 0; j_block < num_k_blocks; j_block++) {
+    const int k_start = j_block * BC;
+    const int k_len = (k_start + BC > src_len) ? (src_len - k_start) : BC;
+
+    for (int i = tx; i < BC * head_dim; i += blockDim.x) {
+      int r = i / head_dim;
+      int c = i % head_dim;
+      if (r < k_len) {
+          s_K[i] = (float)K[k_offset_base + (k_start + r) * stride_k_s + c];
+          s_V[i] = (float)V[v_offset_base + (k_start + r) * stride_k_s + c];
+      } else {
+          s_K[i] = 0.0f; 
+          s_V[i] = 0.0f; 
+      }
+    }
+
+    __syncthreads();
+
+    if (tx < q_len) {
+      const int global_q_idx = q_start + tx;
+      
+      float scores[BC];
+      float row_m_curr = -INFINITY;
+      bool has_valid = false;
+
+      // Q * K^T
+      for (int j = 0; j < k_len; j++) {
+        const int global_k_idx = k_start + j;
+
+        if (is_causal && global_k_idx > global_q_idx) {
+          scores[j] = -INFINITY;
+        } else {
+          float dot = 0.0f;
+          for (int d = 0; d < head_dim; d++) {
+            dot += s_Q[tx * head_dim + d] * s_K[j * head_dim + d];
+          }
+          scores[j] = dot * softmax_scale;
+          has_valid = true;
+          
+          if (scores[j] > row_m_curr) {
+            row_m_curr = scores[j];
+          }
+        }
+      }
+
+      for (int j = k_len; j < BC; j++) {
+        scores[j] = -INFINITY;
+      }
+
+      if (has_valid) {
+        const float m_new = fmaxf(m_i, row_m_curr);
+        
+        float row_l_new = 0.0f;
+        float p_exp[BC];
+
+        for (int j = 0; j < k_len; ++j) {
+          if (isinf(scores[j]) && scores[j] < 0.0f) {
+            p_exp[j] = 0.0f;
+          } else {
+            p_exp[j] = expf(scores[j] - m_new);
+          }
+          row_l_new += p_exp[j];
+        }
+
+        // 计算 alpha（使用更稳定的方式）
+        float alpha = 0.0f;
+        if (m_i > -INFINITY) {
+          // 使用 exp 的差值形式，避免大数相减
+          alpha = expf(m_i - m_new);
+        }
+
+        // ============================================================
+        // 关键修复：使用 Kahan 求和减少 l_i 的累积误差
+        // ============================================================
+        {
+          float scaled_l = l_i * alpha;
+          float y = row_l_new - l_c * alpha;  // 补偿也需要缩放
+          float t = scaled_l + y;
+          l_c = (t - scaled_l) - y;
+          l_i = t;
+        }
+        
+        // ============================================================
+        // 关键修复：使用 Kahan 求和减少 acc_o 的累积误差
+        // ============================================================
+        for (int d = 0; d < head_dim; ++d) {
+          // 缩放旧值
+          float scaled_acc = acc_o[d] * alpha;
+          float scaled_c = acc_c[d] * alpha;
+          
+          // 计算新增值
+          float pv_sum = 0.0f;
+          for (int j = 0; j < k_len; ++j) {
+            pv_sum += p_exp[j] * s_V[j * head_dim + d];
+          }
+          
+          // Kahan 求和
+          float y = pv_sum - scaled_c;
+          float t = scaled_acc + y;
+          acc_c[d] = (t - scaled_acc) - y;
+          acc_o[d] = t;
+        }
+
+        m_i = m_new;
+      }
+    }
+    
+    __syncthreads();
+  }
+
+  // 8. 最终归一化并写回
+  if (tx < q_len) {
+    for (int d = 0; d < head_dim; ++d) {
+      float res = (l_i > 1e-6f) ? (acc_o[d] / l_i) : 0.0f; 
+      O[o_offset_base + (q_start + tx) * stride_q_s + d] = (T)res;
+    }
+  }
+}
+
+
+/**
+ * @brief Computes flash attention for given query, key, and value tensors.
+ * 
+ * @tparam T Data type (float) for input/output tensors
+ * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
+ * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
+ * @param[in] batch_size Batch dimension size
+ * @param[in] target_seq_len Target sequence length
+ * @param[in] src_seq_len Source sequence length  
+ * @param[in] query_heads Number of query attention heads
+ * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
+ * @param[in] head_dim Dimension size of each attention head
+ * @param[in] is_causal Whether to apply causal masking
+ */
+
+// 定义分块大小 (Tile Size)
+// 在实际优化中，这些值需要根据 head_dim 和共享内存大小进行调整
+
+template <typename T>
+void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
+                    const std::vector<T>& h_v, std::vector<T>& h_o,
+                    int batch_size, int target_seq_len, int src_seq_len, 
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+  // TODO: Implement the flash attention function
+
+  size_t size_q = h_q.size() * sizeof(T);
+  size_t size_k = h_k.size() * sizeof(T);
+  size_t size_v = h_v.size() * sizeof(T);
+  size_t size_o = h_o.size() * sizeof(T);
+
+  T *d_q, *d_k, *d_v, *d_o;
+  cudaMalloc(&d_q, size_q);
+  cudaMalloc(&d_k, size_k);
+  cudaMalloc(&d_v, size_v);
+  cudaMalloc(&d_o, size_o);
+
+
+  cudaMemcpy(d_q, h_q.data(), size_q, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_k, h_k.data(), size_k, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_v, h_v.data(), size_v, cudaMemcpyHostToDevice);
+  
+  // 4. 配置 Kernel 启动参数
+  // Grid: [Target_Seq_Len / Block_Row, Query_Heads, Batch_Size]
+  dim3 grid((target_seq_len + BR - 1) / BR, query_heads, batch_size);
+  // Block: 实际上通常使用 128 或 256 个线程来协作处理一个 Tile
+  dim3 block(128);
+
+  size_t sram_size = (BR * head_dim + BC * head_dim * 2) * sizeof(float);
+  float softmax_scale = 1.0f / sqrtf((float)head_dim);
+
+  std::cout << "Launching Kernel with Grid: " << grid.x << ", " << grid.y << ", " << grid.z << std::endl;
+
+  flash_attn_kernel<T><<<grid, block, sram_size>>>(
+      d_q, d_k, d_v, d_o,
+      batch_size,
+      target_seq_len,
+      src_seq_len,
+      query_heads,
+      kv_heads,
+      head_dim,
+      softmax_scale,
+      is_causal
+  );
+
+  // 检查 Kernel 错误
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+      printf("CUDA Error: %s\n", cudaGetErrorString(err));
+  }
+
+  h_o.resize(h_q.size());
+  cudaMemcpy(h_o.data(), d_o, size_o, cudaMemcpyDeviceToHost); 
+  
+  // 释放内存
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);  
+
+}
+
+template <typename T>
+__global__ void flash_attn_kernel1(
     const T* __restrict__ Q, 
     const T* __restrict__ K, 
     const T* __restrict__ V, 
@@ -190,8 +509,10 @@ __global__ void flash_attn_kernel(
 
   __syncthreads();
 
+  int num_k_blocks = (src_len + BC - 1) / BC;
+
   // 7. 遍历 K,V的所有Tiles
-  for(int j_block = 0; j_block < (src_len + BC - 1) / BC; j_block++){
+  for(int j_block = 0; j_block < num_k_blocks; j_block++){
     const int k_start = j_block * BC;
     const int k_len = (k_start + BC > src_len) ? (src_len - k_start) : BC;
 
@@ -252,7 +573,7 @@ __global__ void flash_attn_kernel(
       float row_l_new = 0.0f;
       float p_exp[BC];
 
-      for(int j=0; j<k_len; ++j) {
+      for(int j = 0; j < k_len; ++j) {
         if (scores[j] == -INFINITY) {
             p_exp[j] = 0.0f;
         } else {
@@ -263,7 +584,13 @@ __global__ void flash_attn_kernel(
       }
 
       // Rescale previous accumulator
-      float alpha = expf(m_i - m_new);
+      float alpha = 0.0f;
+
+      if (m_new > -INFINITY) {
+          alpha = expf(m_i - m_new);
+      }
+
+
       l_i = l_i * alpha + row_l_new;
       
       // Update O += P * V
@@ -365,90 +692,6 @@ __global__ void flash_attn_kernel(
 
 }
 
-
-
-/**
- * @brief Computes flash attention for given query, key, and value tensors.
- * 
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
- */
-
-// 定义分块大小 (Tile Size)
-// 在实际优化中，这些值需要根据 head_dim 和共享内存大小进行调整
-
-template <typename T>
-void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
-                    const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
-
-  size_t size_q = h_q.size() * sizeof(T);
-  size_t size_k = h_k.size() * sizeof(T);
-  size_t size_v = h_v.size() * sizeof(T);
-  size_t size_o = h_o.size() * sizeof(T);
-
-  T *d_q, *d_k, *d_v, *d_o;
-  cudaMalloc(&d_q, size_q);
-  cudaMalloc(&d_k, size_k);
-  cudaMalloc(&d_v, size_v);
-  cudaMalloc(&d_o, size_o);
-
-
-  cudaMemcpy(d_q, h_q.data(), size_q, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_k, h_k.data(), size_k, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_v, h_v.data(), size_v, cudaMemcpyHostToDevice);
-  
-  // 4. 配置 Kernel 启动参数
-  // Grid: [Target_Seq_Len / Block_Row, Query_Heads, Batch_Size]
-  dim3 grid((target_seq_len + BR - 1) / BR, query_heads, batch_size);
-  // Block: 实际上通常使用 128 或 256 个线程来协作处理一个 Tile
-  dim3 block(128);
-
-  size_t sram_size = (BR * head_dim + BC * head_dim * 2) * sizeof(float);
-  float softmax_scale = 1.0f / sqrtf((float)head_dim);
-
-  std::cout << "Launching Kernel with Grid: " << grid.x << ", " << grid.y << ", " << grid.z << std::endl;
-
-  flash_attn_kernel<T><<<grid, block, sram_size>>>(
-      d_q, d_k, d_v, d_o,
-      batch_size,
-      target_seq_len,
-      src_seq_len,
-      query_heads,
-      kv_heads,
-      head_dim,
-      softmax_scale,
-      is_causal
-  );
-
-  // 检查 Kernel 错误
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-      printf("CUDA Error: %s\n", cudaGetErrorString(err));
-  }
-
-  h_o.resize(h_q.size());
-  cudaMemcpy(h_o.data(), d_o, size_o, cudaMemcpyDeviceToHost); 
-  
-  // 释放内存
-  cudaFree(d_q);
-  cudaFree(d_k);
-  cudaFree(d_v);
-  cudaFree(d_o);  
-
-}
 
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
