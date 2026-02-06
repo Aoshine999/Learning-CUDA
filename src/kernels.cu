@@ -186,18 +186,18 @@ __global__ void flash_attn_kernel(
   float *s_K = sram + BR * head_dim;
   float *s_V = sram + BR * head_dim + BC * head_dim; 
 
-  // 5. 寄存器状态变量
-  float m_i = -INFINITY;
-  float l_i = 0.0f;
-  float acc_o[MAX_HEAD_DIM];
-  
-  // Kahan 补偿变量 - 用于减少累积误差
-  float l_c = 0.0f;  // l_i 的补偿
-  float acc_c[MAX_HEAD_DIM];  // acc_o 的补偿
-  
+  // 5. 寄存器状态变量 - 全部使用 double 减少累积误差
+  double m_i = -INFINITY;
+  double l_i = 0.0;
+  double acc_o[MAX_HEAD_DIM];
+
+  // Kahan 补偿变量 - 全部使用 double
+  double l_c = 0.0;
+  double acc_c[MAX_HEAD_DIM];
+
   for (int d = 0; d < head_dim; ++d) {
-      acc_o[d] = 0.0f;
-      acc_c[d] = 0.0f;
+      acc_o[d] = 0.0;
+      acc_c[d] = 0.0;
   }
 
   // 6. 加载 Q Block
@@ -269,56 +269,84 @@ __global__ void flash_attn_kernel(
       }
 
       if (has_valid) {
-        const float m_new = fmaxf(m_i, row_m_curr);
-        
+        const float m_new_float = fmaxf((float)m_i, row_m_curr);
+        const double m_new = m_new_float;  // 转换为 double 进行后续计算
+
         float row_l_new = 0.0f;
         float p_exp[BC];
 
+        // 使用 float 计算 exp，配合 FMA 减少误差
         for (int j = 0; j < k_len; ++j) {
           if (isinf(scores[j]) && scores[j] < 0.0f) {
             p_exp[j] = 0.0f;
           } else {
-            p_exp[j] = expf(scores[j] - m_new);
+            p_exp[j] = expf(scores[j] - m_new_float);
           }
-          row_l_new += p_exp[j];
         }
 
-        // 计算 alpha（使用更稳定的方式）
-        float alpha = 0.0f;
+        // 使用 FMA 进行 pairwise 求和（更精确）
+        int j;
+        for (j = 0; j + 1 < k_len; j += 2) {
+          row_l_new = __fmaf_rn(p_exp[j], 1.0f, row_l_new);
+          row_l_new = __fmaf_rn(p_exp[j + 1], 1.0f, row_l_new);
+        }
+        if (j < k_len) {
+          row_l_new = __fmaf_rn(p_exp[j], 1.0f, row_l_new);
+        }
+
+        // 计算 alpha（使用 double 精度）
+        double alpha = 0.0;
         if (m_i > -INFINITY) {
-          // 使用 exp 的差值形式，避免大数相减
-          alpha = expf(m_i - m_new);
+          double diff = m_i - m_new;
+          // 当 diff 很小时，使用泰勒展开 exp(x) ≈ 1 + x + x²/2
+          if (fabs(diff) < 1e-4) {
+            alpha = 1.0 + diff + 0.5 * diff * diff;
+          } else {
+            alpha = exp(diff);
+          }
         }
 
         // ============================================================
-        // 关键修复：使用 Kahan 求和减少 l_i 的累积误差
+        // 正确的 Kahan 求和实现：l_i = l_i * alpha + row_l_new
+        // 使用 double 精度进行累加
         // ============================================================
         {
-          float scaled_l = l_i * alpha;
-          float y = row_l_new - l_c * alpha;  // 补偿也需要缩放
-          float t = scaled_l + y;
-          l_c = (t - scaled_l) - y;
+          // 步骤1: 缩放旧值和补偿
+          l_i *= alpha;
+          l_c *= alpha;
+
+          // 步骤2: 使用 Kahan 求和加上新值（row_l_new 转为 double）
+          double row_l_new_d = (double)row_l_new;
+          double y = row_l_new_d - l_c;
+          double t = l_i + y;
+          l_c = (t - l_i) - y;
           l_i = t;
         }
-        
+
         // ============================================================
-        // 关键修复：使用 Kahan 求和减少 acc_o 的累积误差
+        // 使用 double 精度进行 acc_o 的 Kahan 求和
         // ============================================================
         for (int d = 0; d < head_dim; ++d) {
-          // 缩放旧值
-          float scaled_acc = acc_o[d] * alpha;
-          float scaled_c = acc_c[d] * alpha;
-          
-          // 计算新增值
+          // 步骤1: 缩放旧值和补偿（使用 double）
+          acc_o[d] *= alpha;
+          acc_c[d] *= alpha;
+
+          // 步骤2: 使用 FMA 进行 pairwise 求和（float 计算）
           float pv_sum = 0.0f;
-          for (int j = 0; j < k_len; ++j) {
-            pv_sum += p_exp[j] * s_V[j * head_dim + d];
+          int j;
+          for (j = 0; j + 1 < k_len; j += 2) {
+            pv_sum = __fmaf_rn(p_exp[j], s_V[j * head_dim + d], pv_sum);
+            pv_sum = __fmaf_rn(p_exp[j + 1], s_V[(j + 1) * head_dim + d], pv_sum);
           }
-          
-          // Kahan 求和
-          float y = pv_sum - scaled_c;
-          float t = scaled_acc + y;
-          acc_c[d] = (t - scaled_acc) - y;
+          if (j < k_len) {
+            pv_sum = __fmaf_rn(p_exp[j], s_V[j * head_dim + d], pv_sum);
+          }
+
+          // 步骤3: 转换为 double 进行 Kahan 求和
+          double pv_sum_d = (double)pv_sum;
+          double y = pv_sum_d - acc_c[d];
+          double t = acc_o[d] + y;
+          acc_c[d] = (t - acc_o[d]) - y;
           acc_o[d] = t;
         }
 
@@ -393,7 +421,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   std::cout << "Launching Kernel with Grid: " << grid.x << ", " << grid.y << ", " << grid.z << std::endl;
 
-  flash_attn_kernel<T><<<grid, block, sram_size>>>(
+  flash_attn_kernel1<T><<<grid, block, sram_size>>>(
       d_q, d_k, d_v, d_o,
       batch_size,
       target_seq_len,
@@ -484,18 +512,8 @@ __global__ void flash_attn_kernel1(
   const int q_len = (q_start + BR > tgt_len) ? (tgt_len - q_start) : BR;
 
 
-  // TODO : 加载数据需要进行优化
-  // for(int i = 0; i < BR; i++){
-  //   for(int d = 0; d < head_dim; d++){
-  //     if(tx == 0){
-  //       s_Q[i * head_dim + d] = (float)Q[q_offset_base + (q_start + i) * stride_q_s + d];
-  //     }
-  //   }
-  // }
-
   // 3. 加载 Q Tile (协作加载)
   // 关键修正：利用所有线程加载数据
-  // TODO 有点别扭
   for (int i = tx; i < BR * head_dim; i += blockDim.x) {
       int r = i / head_dim;
       int c = i % head_dim;
@@ -516,17 +534,6 @@ __global__ void flash_attn_kernel1(
     const int k_start = j_block * BC;
     const int k_len = (k_start + BC > src_len) ? (src_len - k_start) : BC;
 
-    //TODO: 加载 K,V 需要进行优化
-    // 加载 K,V 到共享内存
-    // for(int i = 0; i < BC; i++){
-    //   for(int d = 0; d < head_dim; d++){
-    //     if(k_start + i < src_len && tx == 0){
-    //       s_K[i * head_dim + d] = (float)K[k_offset_base + (k_start + i) * stride_k_s + d];
-    //       s_V[i * head_dim + d] = (float)V[v_offset_base + (k_start + i) * stride_k_s + d];
-    //     }
-    //   }
-    // }
-
     for(int i = tx; i < BC * head_dim; i += blockDim.x){
       int r = i / head_dim;
       int c = i % head_dim;
@@ -546,7 +553,6 @@ __global__ void flash_attn_kernel1(
     if(tx < q_len){
       int global_q_idx = q_start + tx;
       
-      // 这里的逻辑现在是安全的，只影响当前线程的寄存器
       float scores[BC]; // 寄存器数组
       float row_m_curr = -INFINITY;
 
@@ -603,65 +609,6 @@ __global__ void flash_attn_kernel1(
 
       m_i = m_new;
     }
-
-    // 计算 Attention Scores
-    // for(int i = 0; i < BR; i++){
-    //   int global_q_idx = q_start + i;
-    //   if(global_q_idx >= tgt_len) continue;
-
-    //   // 计算当前Row 与当前 K block的点积
-    //   float scores[BC];
-    //   float row_m_prev = m_i;
-    //   float row_m_curr = -INFINITY;
-
-    //   for(int j = 0; j < BC; j++){
-    //     int global_k_idx = k_start + j;
-
-    //     //Casual Masking: 如果是因果且 k > q, 则掩盖
-    //     if(is_causal && global_k_idx > global_q_idx){
-    //       scores[j] = -INFINITY;
-    //       continue;
-    //     }
-    //     if (global_k_idx >= src_len) {
-    //       scores[j] = -INFINITY;
-    //       continue;
-    //     }
-
-    //     float dot = 0.0f;
-    //     for(int d = 0; d < head_dim; d++){
-    //       dot += s_Q[i * head_dim + d] * s_K[j * head_dim + d];
-    //     }
-    //     scores[j] = dot * softmax_scale;
-    //     // 更新当前行的最大值
-    //     if(scores[j] > row_m_curr) row_m_curr = scores[j];
-    //   }
-
-    //   // 计算 Online Softmax
-    //   float m_new = fmaxf(m_i, row_m_curr);
-    //   // 计算 P_ij (未归一化的概率)
-    //   float p_exp[BC];
-    //   float row_l_new = 0.0f;
-    //   for(int j=0; j<BC; ++j) {
-    //       if (scores[j] == -INFINITY) p_exp[j] = 0.0f;
-    //       else p_exp[j] = expf(scores[j] - m_new);
-    //       row_l_new += p_exp[j];
-    //   }
-
-    //   // 修正之前的 l_i 和 acc_o
-    //   float alpha = expf(m_i - m_new); // 缩放因子
-    //   l_i = l_i * alpha + row_l_new;
-      
-    //   // 8.3 更新 Accumulator O += P * V
-    //   for (int d = 0; d < head_dim; ++d) {
-    //       acc_o[d] *= alpha; // 缩放旧值
-    //       for (int j = 0; j < BC; ++j) {
-    //           acc_o[d] += p_exp[j] * s_V[j * head_dim + d];
-    //       }
-    //   }
-
-    //   m_i = m_new; // 更新全局最大值
-
-    // }
     
     __syncthreads();
   }
@@ -674,21 +621,6 @@ __global__ void flash_attn_kernel1(
         O[o_offset_base + (q_start + tx) * stride_q_s + d] = (T)res;
     }
   }
-
-  // 9. 最终归一化并写回 Global Memory
-  // O = acc_o / l_i
-  // 注意：这里需要将 acc_o 写入到全局内存正确的位置
-  // 实际并行代码中，每个线程负责写一部分 d
-  //TODO 
-  // for (int i = 0; i < BR; ++i) {
-  //   if (tx == 0 && (q_start + i) < tgt_len) {
-  //     for (int d = 0; d < head_dim; ++d) {
-  //         // 这是一个极其简化的写入，实际上 O 的计算也需要在 loop 内完成
-  //         // 这里仅展示逻辑：最终除以分母 l_i
-  //         O[o_offset_base + (q_start + i) * stride_q_s + d] = (T)(acc_o[d] / l_i); 
-  //     }
-  //   }
-  // }
 
 }
 
