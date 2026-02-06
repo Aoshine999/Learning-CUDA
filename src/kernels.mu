@@ -17,10 +17,86 @@
  * @param cols Number of columns in the matrix.
  * @return The trace (sum of diagonal values) of the matrix.
  */
+#define WARP_SIZE 32
+template <typename T>
+__device__ __forceinline__ T warpReduceSum(T val) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
+template <typename T>
+__global__ void traceKernel(const T* d_input, T* d_result, size_t rows, size_t cols, size_t min_dim) {
+  size_t step = cols + 1;
+  __shared__ T partialSum[32];
+
+  size_t global_id = threadIdx.x + blockIdx.x * blockDim.x;
+  size_t warpId = threadIdx.x / WARP_SIZE;
+  size_t laneId = threadIdx.x % WARP_SIZE;
+  size_t numWarps = blockDim.x / WARP_SIZE;
+
+  // 1.加载数据
+  T val = 0;
+  if(global_id < min_dim) {
+    val = d_input[global_id * step];
+  }
+
+  // 2. Warp-level reduction
+  val = warpReduceSum(val);
+
+
+  // 3. 每个 warp 的第一个线程写入共享内存
+  if (laneId == 0) {
+    partialSum[warpId] = val;
+  }
+  __syncthreads();
+
+  // 4. Block-level reduction
+  if (warpId == 0) {
+    val = (laneId < numWarps) ? partialSum[laneId] : 0;
+    val = warpReduceSum(val);
+    if (laneId == 0) {
+      atomicAdd(d_result, val);
+    }
+  }
+}
+
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
-  return T(-1);
+  size_t min_dim = (rows < cols) ? rows : cols;
+  size_t size = rows * cols * sizeof(T);
+
+  // 1. 分配 GPU 内存
+  T* d_input;
+  T* d_result;
+  cudaMalloc(&d_input, size);
+  cudaMalloc(&d_result, sizeof(T));
+
+  // 2. 将数据从 Host 拷贝到 Device
+  cudaMemcpy(d_input, h_input.data(), size, cudaMemcpyHostToDevice);
+
+  // 初始结果设为 0
+  T h_zero = 0;
+  cudaMemcpy(d_result, &h_zero, sizeof(T), cudaMemcpyHostToDevice);
+  
+
+  // 3. 调用CUDA kernel
+  int blockSize = 1024;
+  int numBlocks = (min_dim + blockSize - 1) / blockSize;
+  traceKernel<T><<<numBlocks, blockSize>>>(d_input, d_result, rows, cols, min_dim);
+
+  
+  // 4. 将结果从 Device 拷回 Host
+  T h_result;
+  cudaMemcpy(&h_result, d_result, sizeof(T), cudaMemcpyDeviceToHost);
+
+  // 5. 释放 GPU 内存
+  cudaFree(d_input);
+  cudaFree(d_result);
+
+  return h_result;
 }
 
 /**
